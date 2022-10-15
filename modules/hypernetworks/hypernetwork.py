@@ -67,10 +67,14 @@ class HypernetworkModule(torch.nn.Module):
 def parse_multipliers(dim, state_dict):
     i = 0
     res = [1]
-    while (key := "linear.{}.weight".format(i)) in state_dict:
-        weight = state_dict[key]
-        res.append(len(weight) // dim)
-        i += 1
+    while True:
+        key = "linear.{}.weight".format(i)
+        if key in state_dict:
+            weight = state_dict[key]
+            res.append(len(weight) // dim)
+            i += 1
+            continue
+        break
     return res
 
 def apply_strength(value=None):
@@ -212,21 +216,7 @@ def attention_CrossAttention_forward(self, x, context=None, mask=None):
     return self.to_out(out)
 
 
-def stack_conds(conds):
-    if len(conds) == 1:
-        return torch.stack(conds)
-
-    # same as in reconstruct_multicond_batch
-    token_count = max([x.shape[0] for x in conds])
-    for i in range(len(conds)):
-        if conds[i].shape[0] != token_count:
-            last_vector = conds[i][-1:]
-            last_vector_repeated = last_vector.repeat([token_count - conds[i].shape[0], 1])
-            conds[i] = torch.vstack([conds[i], last_vector_repeated])
-
-    return torch.stack(conds)
-
-def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log_directory, steps, create_image_every, save_hypernetwork_every, template_file, preview_from_txt2img, preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height):
+def train_hypernetwork(hypernetwork_name, learn_rate, data_root, log_directory, steps, create_image_every, save_hypernetwork_every, template_file, preview_from_txt2img, preview_prompt, preview_negative_prompt, preview_steps, preview_sampler_index, preview_cfg_scale, preview_seed, preview_width, preview_height):
     assert hypernetwork_name, 'hypernetwork not selected'
 
     path = shared.hypernetworks.get(hypernetwork_name, None)
@@ -255,7 +245,7 @@ def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log
 
     shared.state.textinfo = f"Preparing dataset from {html.escape(data_root)}..."
     with torch.autocast("cuda"):
-        ds = modules.textual_inversion.dataset.PersonalizedBase(data_root=data_root, width=512, height=512, repeats=shared.opts.training_image_repeats_per_epoch, placeholder_token=hypernetwork_name, model=shared.sd_model, device=devices.device, template_file=template_file, include_cond=True, batch_size=batch_size)
+        ds = modules.textual_inversion.dataset.PersonalizedBase(data_root=data_root, width=512, height=512, repeats=shared.opts.training_image_repeats_per_epoch, placeholder_token=hypernetwork_name, model=shared.sd_model, device=devices.device, template_file=template_file, include_cond=True)
 
     if unload:
         shared.sd_model.cond_stage_model.to(devices.cpu)
@@ -279,7 +269,7 @@ def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log
     optimizer = torch.optim.AdamW(weights, lr=scheduler.learn_rate)
 
     pbar = tqdm.tqdm(enumerate(ds), total=steps - ititial_step)
-    for i, entries in pbar:
+    for i, entry in pbar:
         hypernetwork.step = i + ititial_step
 
         scheduler.apply(optimizer, hypernetwork.step)
@@ -290,12 +280,11 @@ def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log
             break
 
         with torch.autocast("cuda"):
-            c = stack_conds([entry.cond for entry in entries]).to(devices.device)
-#            c = torch.vstack([entry.cond for entry in entries]).to(devices.device)
-            x = torch.stack([entry.latent for entry in entries]).to(devices.device)
-            loss = shared.sd_model(x, c)[0]
+            cond = entry.cond.to(devices.device)
+            x = entry.latent.to(devices.device)
+            loss = shared.sd_model(x.unsqueeze(0), cond)[0]
             del x
-            del c
+            del cond
 
             losses[hypernetwork.step % losses.shape[0]] = loss.item()
 
@@ -337,7 +326,7 @@ def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log
                 p.width = preview_width
                 p.height = preview_height
             else:
-                p.prompt = entries[0].cond_text
+                p.prompt = entry.cond_text
                 p.steps = 20
 
             preview_text = p.prompt
@@ -360,7 +349,7 @@ def train_hypernetwork(hypernetwork_name, learn_rate, batch_size, data_root, log
 <p>
 Loss: {losses.mean():.7f}<br/>
 Step: {hypernetwork.step}<br/>
-Last prompt: {html.escape(entries[0].cond_text)}<br/>
+Last prompt: {html.escape(entry.cond_text)}<br/>
 Last saved embedding: {html.escape(last_saved_file)}<br/>
 Last saved image: {html.escape(last_saved_image)}<br/>
 </p>
@@ -373,5 +362,4 @@ Last saved image: {html.escape(last_saved_image)}<br/>
     hypernetwork.save(filename)
 
     return hypernetwork, filename
-
 
