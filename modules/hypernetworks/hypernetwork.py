@@ -18,30 +18,60 @@ import modules.textual_inversion.dataset
 from modules.textual_inversion import textual_inversion
 from modules.textual_inversion.learn_schedule import LearnRateScheduler
 
-
 class HypernetworkModule(torch.nn.Module):
     multiplier = 1.0
 
-    def __init__(self, dim, state_dict=None):
+    def __init__(self, dim, state_dict=None, multipliers = None):
         super().__init__()
-
-        self.linear1 = torch.nn.Linear(dim, dim * 2)
-        self.linear2 = torch.nn.Linear(dim * 2, dim)
-
-        if state_dict is not None:
-            self.load_state_dict(state_dict, strict=True)
+        if (state_dict is None or 'linear.0.weight' not in state_dict) and multipliers is None:
+            multipliers = (1, 2, 1)
         else:
+            if multipliers is not None:
+                assert multipliers[0] == 1, "Multiplier Sequence should start with size 1!"
+                assert multipliers[-1] == 1, "Multiplier Sequence should end with size 1!"
+            else:
+                multipliers = parse_multipliers(dim, state_dict)
 
-            self.linear1.weight.data.normal_(mean=0.0, std=0.01)
-            self.linear1.bias.data.zero_()
-            self.linear2.weight.data.normal_(mean=0.0, std=0.01)
-            self.linear2.bias.data.zero_()
-
+        self.state_dict()['multipliers'] = multipliers
+        linears = [torch.nn.Linear(int(dim * multipliers[i]), int(dim * multipliers[i+1])) for i in range(len(multipliers) - 1)]
+        self.linear = torch.nn.Sequential(*linears)
+        if state_dict is not None:
+            try:
+                self.load_state_dict(state_dict)
+            except RuntimeError:
+                print(state_dict.keys())
+                print(self.state_dict().keys())
+                self.try_load_previous(state_dict)
+        else:
+            for layer in self.linear:
+                layer.weight.data.normal_(mean = 0.0, std = 0.01)
+                layer.bias.data.zero_()
         self.to(devices.device)
 
-    def forward(self, x):
-        return x + (self.linear2(self.linear1(x))) * self.multiplier
+    def try_load_previous(self, state_dict):
+        states = self.state_dict()
+        states['linear.0.bias'].copy_(state_dict['linear1.bias'])
+        states['linear.0.weight'].copy_(state_dict['linear1.weight'])
+        states['linear.1.bias'].copy_(state_dict['linear2.bias'])
+        states['linear.1.weight'].copy_(state_dict['linear2.weight'])
 
+    def forward(self, x):
+        return x + self.linear(x) * self.multiplier
+
+    def trainables(self):
+        res = []
+        for layer in self.linear:
+            res += [layer.weight, layer.bias]
+        return res
+    
+def parse_multipliers(dim, state_dict):
+    i = 0
+    res = [1]
+    while (key := "linear.{}.weight".format(i)) in state_dict:
+        weight = state_dict[key]
+        res.append(len(weight) // dim)
+        i += 1
+    return res
 
 def apply_strength(value=None):
     HypernetworkModule.multiplier = value if value is not None else shared.opts.sd_hypernetwork_strength
